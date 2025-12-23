@@ -196,9 +196,16 @@ class RealtimeBridge:
         logger.debug("Received event: %s", event_type)
 
         # Event handlers mapping
+        # Note: OpenAI Realtime API GA uses "response.output_audio.*" event names
         handlers = {
             "session.created": self._handle_session_created,
             "session.updated": self._handle_session_updated,
+            # Audio output events (GA API uses "output_audio" naming)
+            "response.output_audio.delta": self._handle_audio_delta,
+            "response.output_audio.done": self._handle_audio_done,
+            "response.output_audio_transcript.delta": self._handle_transcript_delta,
+            "response.output_audio_transcript.done": self._handle_transcript_done,
+            # Also support legacy naming (for backwards compatibility)
             "response.audio.delta": self._handle_audio_delta,
             "response.audio.done": self._handle_audio_done,
             "response.audio_transcript.delta": self._handle_transcript_delta,
