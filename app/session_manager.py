@@ -11,6 +11,10 @@ from app.models import (
     ConversationMessage,
 )
 from app.redis_client import get_redis
+from app.external_api import build_enriched_instructions, fetch_user_settings
+
+# Default voice - can be overridden by user settings
+DEFAULT_VOICE = "alloy"
 
 
 def _generate_token() -> str:
@@ -24,20 +28,40 @@ def _generate_conversation_id() -> str:
 
 
 async def create_session(request: SessionCreateRequest, base_url: str = "") -> dict:
-    """Create a new session and store in Redis."""
+    """Create a new session and store in Redis.
+    
+    Fetches user context from external APIs.
+    Backend controls voice, language, and system prompt.
+    """
     settings = get_settings()
     redis = get_redis()
 
     token = _generate_token()
     conversation_id = request.conversation_id or _generate_conversation_id()
 
+    # Fetch user settings to get voice preference
+    voice = DEFAULT_VOICE
+    if request.auth_token:
+        user_settings = await fetch_user_settings(request.auth_token)
+        if user_settings:
+            # Use user's preferred voice if set
+            voice = user_settings.get("voice", DEFAULT_VOICE)
+
+    # Build enriched instructions with user context and system prompt
+    enriched_instructions = await build_enriched_instructions(
+        auth_token=request.auth_token,
+        user_location=request.user_location,
+        coordinates=request.coordinates
+    )
+
     # Create session data
     session = SessionData(
-        voice=request.voice,
-        instructions=request.instructions,
+        voice=voice,
+        instructions=enriched_instructions,
         conversation_id=conversation_id,
         created_at=time.time(),
-        status="pending"
+        status="pending",
+        auth_token=request.auth_token
     )
 
     # Store session with TTL
