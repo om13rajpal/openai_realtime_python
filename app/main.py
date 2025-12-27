@@ -2,11 +2,12 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, AsyncGenerator
 
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI
 
 from app.config import get_settings
@@ -17,6 +18,7 @@ from app.models import (
     WebSocketMessage,
     MaritimeChatRequest,
     MaritimeChatResponse,
+    StructuredChatResponse,
     ToolCallInfo,
     AddVesselDetailsRequest,
     AddVesselDetailsResponse,
@@ -25,6 +27,8 @@ from app.models import (
 from app.session_manager import (
     create_session,
     get_session,
+    get_conversation,
+    add_to_conversation,
     delete_session,
     delete_conversation,
     update_session_status,
@@ -33,6 +37,11 @@ from app.realtime_bridge import RealtimeBridge
 from app.tools import MARITIME_TOOLS, execute_tool
 from app.system_prompt import MARITIME_SAFETY_PROMPT
 from app.external_api import format_user_context, fetch_user_settings, fetch_weather_data
+from app.response_formatter import (
+    format_response_from_tool_calls,
+    format_normal_response,
+    create_streaming_chunk,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -166,16 +175,22 @@ async def websocket_endpoint(
         await delete_session(token, session.conversation_id)
 
 
-@app.post("/maritime-chat", response_model=MaritimeChatResponse)
+@app.post("/maritime-chat", response_model=StructuredChatResponse)
 async def maritime_chat(request: MaritimeChatRequest):
     """
     Maritime chat endpoint with tool-augmented LLM responses.
+
+    Returns structured JSON responses with type field:
+    - weather: includes 'report' field with weather details
+    - assistance: includes 'local_assistance' array
+    - route: includes 'trip_plan' with route and analysis
+    - normal: just message text
 
     This endpoint:
     1. Receives user messages about maritime queries
     2. Uses LLM with function calling to determine which tools to use
     3. Executes tools (weather, local assistance, route planning)
-    4. Returns AI response with tool results
+    4. Returns structured AI response with typed data
     """
     settings = get_settings()
     client = AsyncOpenAI(api_key=settings.openai_api_key)
@@ -238,11 +253,11 @@ async def maritime_chat(request: MaritimeChatRequest):
                 # Execute the tool
                 result = await execute_tool(tool_name, tool_args, request.auth_token)
 
-                tool_calls_made.append(ToolCallInfo(
-                    tool_name=tool_name,
-                    arguments=tool_args,
-                    result=result
-                ))
+                tool_calls_made.append({
+                    "tool_name": tool_name,
+                    "arguments": tool_args,
+                    "result": result
+                })
 
                 # Check for route data
                 if tool_name == "plan_and_analyze_marine_route" and result.get("success"):
@@ -280,19 +295,353 @@ async def maritime_chat(request: MaritimeChatRequest):
                 messages=messages
             )
 
-            final_message = final_response.choices[0].message.content
+            final_message = final_response.choices[0].message.content or ""
         else:
-            final_message = assistant_message.content
+            final_message = assistant_message.content or ""
 
-        return MaritimeChatResponse(
-            success=True,
+        # Format response using the response formatter
+        structured_response = format_response_from_tool_calls(
             message=final_message or "I'm here to help with maritime questions.",
-            tool_calls=tool_calls_made if tool_calls_made else None,
+            tool_calls=tool_calls_made,
             route_data=route_data
         )
 
+        return StructuredChatResponse(**structured_response)
+
     except Exception as e:
         logger.error("Maritime chat error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/maritime-chat/stream")
+async def maritime_chat_stream(request: MaritimeChatRequest):
+    """
+    Streaming maritime chat endpoint with real-time JSON updates.
+
+    Returns Server-Sent Events (SSE) with partial JSON updates as they become available.
+    Each event contains a delta with the updated field and value.
+
+    Event format:
+    - type: "delta" | "complete" | "error"
+    - field: field name being updated
+    - value: new value for the field
+    - response_type: weather | assistance | route | normal
+    """
+
+    async def generate_stream() -> AsyncGenerator[str, None]:
+        settings = get_settings()
+        client = AsyncOpenAI(api_key=settings.openai_api_key)
+
+        try:
+            # Build context from user data
+            user_settings = None
+            weather_data = None
+
+            if request.auth_token:
+                user_settings = await fetch_user_settings(request.auth_token)
+                if request.coordinates:
+                    weather_data = await fetch_weather_data(request.auth_token, request.coordinates)
+
+            # Format user context
+            context = format_user_context(user_settings, weather_data, request.user_location)
+
+            # Add vessel info to context if provided
+            if request.vessels:
+                vessel_info = [
+                    {"make": v.get("make", "Unknown"), "model": v.get("model", "Unknown"), "year": v.get("year", "Unknown")}
+                    for v in request.vessels
+                ]
+                context += f"\n[Vessel Info: {vessel_info}]"
+
+            # Build system prompt with context
+            system_prompt = f"{context}\n\n{MARITIME_SAFETY_PROMPT}" if context else MARITIME_SAFETY_PROMPT
+
+            # Build messages
+            messages = [{"role": "system", "content": system_prompt}]
+
+            # Add conversation history if provided
+            if request.conversation_history:
+                for msg in request.conversation_history:
+                    messages.append({"role": msg.role, "content": msg.content})
+
+            # Add current user message
+            messages.append({"role": "user", "content": request.message})
+
+            # First call to determine tool usage
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                tools=MARITIME_TOOLS,
+                tool_choice="auto"
+            )
+
+            assistant_message = response.choices[0].message
+            tool_calls_made = []
+            route_data = None
+
+            # Process tool calls if any
+            if assistant_message.tool_calls:
+                # Send processing status
+                yield f"data: {json.dumps({'type': 'status', 'status': 'processing_tools'})}\n\n"
+
+                tool_results = []
+                for tool_call in assistant_message.tool_calls:
+                    tool_name = tool_call.function.name
+                    tool_args = json.loads(tool_call.function.arguments)
+
+                    # Send tool execution status
+                    yield f"data: {json.dumps({'type': 'tool_start', 'tool': tool_name})}\n\n"
+
+                    # Execute the tool
+                    result = await execute_tool(tool_name, tool_args, request.auth_token)
+
+                    tool_calls_made.append({
+                        "tool_name": tool_name,
+                        "arguments": tool_args,
+                        "result": result
+                    })
+
+                    # Check for route data
+                    if tool_name == "plan_and_analyze_marine_route" and result.get("success"):
+                        route_data = result
+
+                    # Send tool result preview
+                    yield f"data: {json.dumps({'type': 'tool_complete', 'tool': tool_name, 'success': result.get('success', False)})}\n\n"
+
+                    tool_results.append({
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "content": json.dumps(result)
+                    })
+
+                # Add messages for final response
+                messages.append({
+                    "role": "assistant",
+                    "content": assistant_message.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments
+                            }
+                        }
+                        for tc in assistant_message.tool_calls
+                    ]
+                })
+                messages.extend(tool_results)
+
+                # Stream final response
+                yield f"data: {json.dumps({'type': 'status', 'status': 'generating_response'})}\n\n"
+
+                stream = await client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=messages,
+                    stream=True
+                )
+
+                full_message = ""
+                async for chunk in stream:
+                    if chunk.choices[0].delta.content:
+                        content = chunk.choices[0].delta.content
+                        full_message += content
+                        yield f"data: {json.dumps({'type': 'message_delta', 'content': content})}\n\n"
+
+                # Format and send final structured response
+                structured_response = format_response_from_tool_calls(
+                    message=full_message or "I'm here to help with maritime questions.",
+                    tool_calls=tool_calls_made,
+                    route_data=route_data
+                )
+
+                yield f"data: {json.dumps({'type': 'complete', 'response': structured_response})}\n\n"
+
+            else:
+                # Stream response directly
+                yield f"data: {json.dumps({'type': 'status', 'status': 'generating_response'})}\n\n"
+
+                stream = await client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=messages,
+                    stream=True
+                )
+
+                full_message = ""
+                async for chunk in stream:
+                    if chunk.choices[0].delta.content:
+                        content = chunk.choices[0].delta.content
+                        full_message += content
+                        yield f"data: {json.dumps({'type': 'message_delta', 'content': content})}\n\n"
+
+                # Format and send final response
+                structured_response = format_normal_response(
+                    message=full_message or "I'm here to help with maritime questions."
+                )
+
+                yield f"data: {json.dumps({'type': 'complete', 'response': structured_response})}\n\n"
+
+        except Exception as e:
+            logger.error("Streaming chat error: %s", e)
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(
+        generate_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
+@app.post("/chat/with-context")
+async def chat_with_context(request: MaritimeChatRequest, conversation_id: Optional[str] = Query(None)):
+    """
+    Chat endpoint that maintains context across text and voice sessions.
+
+    This endpoint allows sharing conversation history between:
+    - Text-based chat (this endpoint)
+    - Voice-based chat (WebSocket)
+
+    If a conversation_id is provided, it will:
+    1. Load existing conversation history from Redis
+    2. Add the new message and response to history
+    3. Return the structured response
+
+    This enables seamless switching between voice and text modes
+    while maintaining full conversation context.
+    """
+    settings = get_settings()
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+
+    try:
+        # Build context from user data
+        user_settings = None
+        weather_data = None
+
+        if request.auth_token:
+            user_settings = await fetch_user_settings(request.auth_token)
+            if request.coordinates:
+                weather_data = await fetch_weather_data(request.auth_token, request.coordinates)
+
+        # Format user context
+        context = format_user_context(user_settings, weather_data, request.user_location)
+
+        # Add vessel info to context if provided
+        if request.vessels:
+            vessel_info = [
+                {"make": v.get("make", "Unknown"), "model": v.get("model", "Unknown"), "year": v.get("year", "Unknown")}
+                for v in request.vessels
+            ]
+            context += f"\n[Vessel Info: {vessel_info}]"
+
+        # Build system prompt with context
+        system_prompt = f"{context}\n\n{MARITIME_SAFETY_PROMPT}" if context else MARITIME_SAFETY_PROMPT
+
+        # Build messages from Redis history if conversation_id provided
+        messages = [{"role": "system", "content": system_prompt}]
+
+        if conversation_id:
+            # Load conversation history from Redis
+            conv_data = await get_conversation(conversation_id)
+            if conv_data:
+                for msg in conv_data.history:
+                    messages.append({
+                        "role": msg.role,
+                        "content": msg.transcript
+                    })
+
+        # Also add any conversation history from the request
+        if request.conversation_history:
+            for msg in request.conversation_history:
+                messages.append({"role": msg.role, "content": msg.content})
+
+        # Add current user message
+        messages.append({"role": "user", "content": request.message})
+
+        # Call OpenAI with tools
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            tools=MARITIME_TOOLS,
+            tool_choice="auto"
+        )
+
+        assistant_message = response.choices[0].message
+        tool_calls_made = []
+        route_data = None
+
+        # Process tool calls if any
+        if assistant_message.tool_calls:
+            tool_results = []
+            for tool_call in assistant_message.tool_calls:
+                tool_name = tool_call.function.name
+                tool_args = json.loads(tool_call.function.arguments)
+
+                result = await execute_tool(tool_name, tool_args, request.auth_token)
+
+                tool_calls_made.append({
+                    "tool_name": tool_name,
+                    "arguments": tool_args,
+                    "result": result
+                })
+
+                if tool_name == "plan_and_analyze_marine_route" and result.get("success"):
+                    route_data = result
+
+                tool_results.append({
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "content": json.dumps(result)
+                })
+
+            messages.append({
+                "role": "assistant",
+                "content": assistant_message.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
+                    }
+                    for tc in assistant_message.tool_calls
+                ]
+            })
+            messages.extend(tool_results)
+
+            final_response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages
+            )
+
+            final_message = final_response.choices[0].message.content or ""
+        else:
+            final_message = assistant_message.content or ""
+
+        # Save to conversation history if conversation_id provided
+        if conversation_id:
+            await add_to_conversation(conversation_id, "user", request.message, "text")
+            await add_to_conversation(conversation_id, "assistant", final_message, "text")
+
+        # Format response
+        structured_response = format_response_from_tool_calls(
+            message=final_message or "I'm here to help with maritime questions.",
+            tool_calls=tool_calls_made,
+            route_data=route_data
+        )
+
+        # Add conversation_id to response for reference
+        structured_response["conversation_id"] = conversation_id
+
+        return StructuredChatResponse(**structured_response)
+
+    except Exception as e:
+        logger.error("Chat with context error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 

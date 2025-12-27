@@ -81,6 +81,18 @@ class MaritimeChatResponse(BaseModel):
     )
 
 
+class StructuredChatResponse(BaseModel):
+    """Structured response body for POST /maritime-chat with type field.
+
+    Response structure follows the specification:
+    - weather: includes 'report' field with weather details
+    - assistance: includes 'local_assistance' array
+    - route: includes 'trip_plan' with route and analysis
+    - normal: just message text
+    """
+    response: dict = Field(..., description="Structured response with type field")
+
+
 # --- Vessel Details Models ---
 
 class VesselInput(BaseModel):
