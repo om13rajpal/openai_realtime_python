@@ -23,7 +23,9 @@ from app.models import (
     AddVesselDetailsRequest,
     AddVesselDetailsResponse,
     VesselDetails,
+    AudioData,
 )
+from app.tts_service import generate_speech_base64, get_audio_mime_type
 from app.session_manager import (
     create_session,
     get_session,
@@ -191,6 +193,10 @@ async def maritime_chat(request: MaritimeChatRequest):
     2. Uses LLM with function calling to determine which tools to use
     3. Executes tools (weather, local assistance, route planning)
     4. Returns structured AI response with typed data
+
+    Optional features (controlled by request parameters):
+    - include_audio: If True, includes TTS audio in response
+    - preload_weather: If False, skips weather preloading into context
     """
     settings = get_settings()
     client = AsyncOpenAI(api_key=settings.openai_api_key)
@@ -202,11 +208,16 @@ async def maritime_chat(request: MaritimeChatRequest):
 
         if request.auth_token:
             user_settings = await fetch_user_settings(request.auth_token)
-            if request.coordinates:
+            # Only preload weather if preload_weather is True (default)
+            if request.coordinates and request.preload_weather:
                 weather_data = await fetch_weather_data(request.auth_token, request.coordinates)
 
-        # Format user context
-        context = format_user_context(user_settings, weather_data, request.user_location)
+        # Format user context (without weather if preload_weather is False)
+        context = format_user_context(
+            user_settings,
+            weather_data if request.preload_weather else None,
+            request.user_location
+        )
 
         # Add vessel info to context if provided
         if request.vessels:
@@ -306,7 +317,32 @@ async def maritime_chat(request: MaritimeChatRequest):
             route_data=route_data
         )
 
-        return StructuredChatResponse(**structured_response)
+        # Generate TTS audio if requested
+        audio_data = None
+        if request.include_audio and final_message:
+            voice = request.audio_voice or "nova"
+            # Validate voice
+            valid_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+            if voice not in valid_voices:
+                voice = "nova"
+
+            audio_base64 = await generate_speech_base64(
+                text=final_message,
+                voice=voice,
+            )
+
+            if audio_base64:
+                audio_data = AudioData(
+                    audio_base64=audio_base64,
+                    audio_format="mp3",
+                    audio_mime_type="audio/mpeg",
+                    voice=voice,
+                )
+
+        return StructuredChatResponse(
+            response=structured_response.get("response", structured_response),
+            audio=audio_data,
+        )
 
     except Exception as e:
         logger.error("Maritime chat error: %s", e)
@@ -326,6 +362,10 @@ async def maritime_chat_stream(request: MaritimeChatRequest):
     - field: field name being updated
     - value: new value for the field
     - response_type: weather | assistance | route | normal
+
+    Optional features:
+    - include_audio: If True, includes TTS audio in final 'complete' event
+    - preload_weather: If False, skips weather preloading into context
     """
 
     async def generate_stream() -> AsyncGenerator[str, None]:
@@ -339,11 +379,16 @@ async def maritime_chat_stream(request: MaritimeChatRequest):
 
             if request.auth_token:
                 user_settings = await fetch_user_settings(request.auth_token)
-                if request.coordinates:
+                # Only preload weather if preload_weather is True (default)
+                if request.coordinates and request.preload_weather:
                     weather_data = await fetch_weather_data(request.auth_token, request.coordinates)
 
-            # Format user context
-            context = format_user_context(user_settings, weather_data, request.user_location)
+            # Format user context (without weather if preload_weather is False)
+            context = format_user_context(
+                user_settings,
+                weather_data if request.preload_weather else None,
+                request.user_location
+            )
 
             # Add vessel info to context if provided
             if request.vessels:
@@ -455,7 +500,26 @@ async def maritime_chat_stream(request: MaritimeChatRequest):
                     route_data=route_data
                 )
 
-                yield f"data: {json.dumps({'type': 'complete', 'response': structured_response})}\n\n"
+                # Generate audio if requested
+                audio_data = None
+                if request.include_audio and full_message:
+                    voice = request.audio_voice or "nova"
+                    valid_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+                    if voice not in valid_voices:
+                        voice = "nova"
+                    audio_base64 = await generate_speech_base64(text=full_message, voice=voice)
+                    if audio_base64:
+                        audio_data = {
+                            "audio_base64": audio_base64,
+                            "audio_format": "mp3",
+                            "audio_mime_type": "audio/mpeg",
+                            "voice": voice,
+                        }
+
+                complete_response = {'type': 'complete', 'response': structured_response}
+                if audio_data:
+                    complete_response['audio'] = audio_data
+                yield f"data: {json.dumps(complete_response)}\n\n"
 
             else:
                 # Stream response directly
@@ -479,7 +543,26 @@ async def maritime_chat_stream(request: MaritimeChatRequest):
                     message=full_message or "I'm here to help with maritime questions."
                 )
 
-                yield f"data: {json.dumps({'type': 'complete', 'response': structured_response})}\n\n"
+                # Generate audio if requested
+                audio_data = None
+                if request.include_audio and full_message:
+                    voice = request.audio_voice or "nova"
+                    valid_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+                    if voice not in valid_voices:
+                        voice = "nova"
+                    audio_base64 = await generate_speech_base64(text=full_message, voice=voice)
+                    if audio_base64:
+                        audio_data = {
+                            "audio_base64": audio_base64,
+                            "audio_format": "mp3",
+                            "audio_mime_type": "audio/mpeg",
+                            "voice": voice,
+                        }
+
+                complete_response = {'type': 'complete', 'response': structured_response}
+                if audio_data:
+                    complete_response['audio'] = audio_data
+                yield f"data: {json.dumps(complete_response)}\n\n"
 
         except Exception as e:
             logger.error("Streaming chat error: %s", e)
@@ -512,6 +595,10 @@ async def chat_with_context(request: MaritimeChatRequest, conversation_id: Optio
 
     This enables seamless switching between voice and text modes
     while maintaining full conversation context.
+
+    Optional features:
+    - include_audio: If True, includes TTS audio in response
+    - preload_weather: If False, skips weather preloading into context
     """
     settings = get_settings()
     client = AsyncOpenAI(api_key=settings.openai_api_key)
@@ -523,11 +610,16 @@ async def chat_with_context(request: MaritimeChatRequest, conversation_id: Optio
 
         if request.auth_token:
             user_settings = await fetch_user_settings(request.auth_token)
-            if request.coordinates:
+            # Only preload weather if preload_weather is True (default)
+            if request.coordinates and request.preload_weather:
                 weather_data = await fetch_weather_data(request.auth_token, request.coordinates)
 
-        # Format user context
-        context = format_user_context(user_settings, weather_data, request.user_location)
+        # Format user context (without weather if preload_weather is False)
+        context = format_user_context(
+            user_settings,
+            weather_data if request.preload_weather else None,
+            request.user_location
+        )
 
         # Add vessel info to context if provided
         if request.vessels:
@@ -638,7 +730,31 @@ async def chat_with_context(request: MaritimeChatRequest, conversation_id: Optio
         # Add conversation_id to response for reference
         structured_response["conversation_id"] = conversation_id
 
-        return StructuredChatResponse(**structured_response)
+        # Generate TTS audio if requested
+        audio_data = None
+        if request.include_audio and final_message:
+            voice = request.audio_voice or "nova"
+            valid_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+            if voice not in valid_voices:
+                voice = "nova"
+
+            audio_base64 = await generate_speech_base64(
+                text=final_message,
+                voice=voice,
+            )
+
+            if audio_base64:
+                audio_data = AudioData(
+                    audio_base64=audio_base64,
+                    audio_format="mp3",
+                    audio_mime_type="audio/mpeg",
+                    voice=voice,
+                )
+
+        return StructuredChatResponse(
+            response=structured_response.get("response", structured_response),
+            audio=audio_data,
+        )
 
     except Exception as e:
         logger.error("Chat with context error: %s", e)

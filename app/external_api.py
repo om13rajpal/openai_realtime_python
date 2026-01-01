@@ -132,28 +132,41 @@ def format_user_context(
 async def build_enriched_instructions(
     auth_token: Optional[str],
     user_location: Optional[str],
-    coordinates: Optional[list[list[float]]]
+    coordinates: Optional[list[list[float]]],
+    preload_weather: bool = True
 ) -> str:
     """Build enriched instructions with user context.
-    
+
     Uses the backend system prompt and enriches it with
     user context fetched from external APIs.
+
+    Args:
+        auth_token: User's auth token for external APIs
+        user_location: User's current location name
+        coordinates: Route coordinates for weather
+        preload_weather: Whether to preload weather data into context (default: True)
+                        Set to False to disable automatic weather preloading
     """
     # Fetch external data if auth token available
     user_settings = None
     weather_data = None
-    
+
     if auth_token:
         user_settings = await fetch_user_settings(auth_token)
-        
-        if coordinates:
+
+        # Only fetch weather if preload_weather is True
+        if coordinates and preload_weather:
             weather_data = await fetch_weather_data(auth_token, coordinates)
-    
-    # Format context
-    context = format_user_context(user_settings, weather_data, user_location)
-    
+
+    # Format context (without weather if preload_weather is False)
+    context = format_user_context(
+        user_settings,
+        weather_data if preload_weather else None,
+        user_location
+    )
+
     # Combine context with system prompt (backend owns the prompt)
     if context:
         return f"{context}\n\n{MARITIME_SAFETY_PROMPT}"
-    
+
     return MARITIME_SAFETY_PROMPT

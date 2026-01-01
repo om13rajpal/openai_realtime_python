@@ -48,10 +48,12 @@ async def create_session(request: SessionCreateRequest, base_url: str = "") -> d
             voice = user_settings.get("voice", DEFAULT_VOICE)
 
     # Build enriched instructions with user context and system prompt
+    # Use preload_weather from request (default: True)
     enriched_instructions = await build_enriched_instructions(
         auth_token=request.auth_token,
         user_location=request.user_location,
-        coordinates=request.coordinates
+        coordinates=request.coordinates,
+        preload_weather=request.preload_weather if request.preload_weather is not None else True
     )
 
     # Create session data

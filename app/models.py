@@ -14,6 +14,7 @@ class SessionCreateRequest(BaseModel):
     user_location: Optional[str] = None  # User's current location name
     coordinates: Optional[list[list[float]]] = None  # Route coordinates for weather
     conversation_id: Optional[str] = None  # For resuming conversations
+    preload_weather: Optional[bool] = True  # Whether to preload weather into voice session context
 
 
 class SessionCreateResponse(BaseModel):
@@ -58,6 +59,19 @@ class MaritimeChatRequest(BaseModel):
         default=None,
         description="User's vessel information [{'make': '', 'model': '', 'year': ''}]"
     )
+    # New options for controlling behavior
+    include_audio: Optional[bool] = Field(
+        default=False,
+        description="Whether to include TTS audio in the response"
+    )
+    audio_voice: Optional[str] = Field(
+        default="nova",
+        description="Voice for TTS audio (alloy, echo, fable, onyx, nova, shimmer)"
+    )
+    preload_weather: Optional[bool] = Field(
+        default=True,
+        description="Whether to preload weather data into context (set to False to disable)"
+    )
 
 
 class ToolCallInfo(BaseModel):
@@ -81,6 +95,26 @@ class MaritimeChatResponse(BaseModel):
     )
 
 
+class AudioData(BaseModel):
+    """Audio data for TTS responses."""
+    audio_base64: Optional[str] = Field(
+        default=None,
+        description="Base64-encoded audio data"
+    )
+    audio_format: Optional[str] = Field(
+        default="mp3",
+        description="Audio format (mp3, opus, aac, flac, wav, pcm)"
+    )
+    audio_mime_type: Optional[str] = Field(
+        default="audio/mpeg",
+        description="MIME type of the audio"
+    )
+    voice: Optional[str] = Field(
+        default="nova",
+        description="Voice used for TTS"
+    )
+
+
 class StructuredChatResponse(BaseModel):
     """Structured response body for POST /maritime-chat with type field.
 
@@ -89,8 +123,14 @@ class StructuredChatResponse(BaseModel):
     - assistance: includes 'local_assistance' array
     - route: includes 'trip_plan' with route and analysis
     - normal: just message text
+
+    Optionally includes audio data when include_audio=True in request.
     """
     response: dict = Field(..., description="Structured response with type field")
+    audio: Optional[AudioData] = Field(
+        default=None,
+        description="TTS audio data (only present when include_audio=True)"
+    )
 
 
 # --- Vessel Details Models ---

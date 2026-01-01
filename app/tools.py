@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 
 from app.config import get_settings
+from app.geocoding import geocode_location as nominatim_geocode
 
 logger = logging.getLogger(__name__)
 
@@ -188,39 +189,24 @@ async def fetch_user_weather_preferences(auth_token: str) -> Optional[dict]:
 
 async def geocode_location(location: str) -> Optional[list[float]]:
     """
-    Convert location name to coordinates using a geocoding service.
+    Convert location name to coordinates using OpenStreetMap Nominatim API.
     Returns [longitude, latitude] for searoute compatibility.
 
-    Note: In production, integrate with a proper geocoding API like
-    Google Maps, Mapbox, or OpenStreetMap Nominatim.
+    This function uses the Nominatim geocoding service to support any location
+    worldwide, not just hardcoded maritime locations.
     """
-    # Common maritime locations for demo purposes
-    known_locations = {
-        "miami": [-80.1918, 25.7617],
-        "miami, fl": [-80.1918, 25.7617],
-        "dubai": [55.2708, 25.2048],
-        "dubai marina": [55.1304, 25.0801],
-        "singapore": [103.8198, 1.3521],
-        "hong kong": [114.1694, 22.3193],
-        "rotterdam": [4.4777, 51.9244],
-        "shanghai": [121.4737, 31.2304],
-        "los angeles": [-118.2437, 34.0522],
-        "new york": [-74.0060, 40.7128],
-        "sydney": [151.2093, -33.8688],
-        "mumbai": [72.8777, 19.0760],
-        "cape town": [18.4241, -33.9249],
-        "rio de janeiro": [-43.1729, -22.9068],
-        "tokyo": [139.6917, 35.6895],
-        "london": [-0.1276, 51.5074],
-    }
+    if not location or not location.strip():
+        return None
 
-    location_lower = location.lower().strip()
-    for key, coords in known_locations.items():
-        if key in location_lower or location_lower in key:
-            return coords
+    # Use the Nominatim-based geocoding service
+    coords = await nominatim_geocode(location)
 
-    logger.warning("Could not geocode location: %s", location)
-    return None
+    if coords:
+        logger.info("Successfully geocoded '%s' to [%f, %f]", location, coords[0], coords[1])
+        return coords
+    else:
+        logger.warning("Could not geocode location: %s", location)
+        return None
 
 
 # ============================================================================
@@ -267,16 +253,23 @@ async def get_marine_weather(
         headers = {}
         if auth_token:
             headers["Authorization"] = f"Bearer {auth_token}"
+            logger.info("Weather API request with auth token (first 20 chars): %s...", auth_token[:20] if len(auth_token) > 20 else auth_token)
+        else:
+            logger.warning("Weather API request WITHOUT auth token")
 
         async with httpx.AsyncClient(timeout=15.0) as client:
+            logger.info("Calling weather API: %s with coordinates: %s", f"{EXTERNAL_API_BASE}/weather", coord_str)
             response = await client.get(
                 f"{EXTERNAL_API_BASE}/weather",
                 params={"coordinates": coord_str},
                 headers=headers
             )
 
+            logger.info("Weather API response status: %s", response.status_code)
+
             if response.status_code == 200:
                 data = response.json()
+                logger.info("Weather API response data keys: %s", list(data.keys()) if isinstance(data, dict) else type(data))
                 weather_data = data.get("data", data) if isinstance(data, dict) else data
 
                 return {
@@ -291,10 +284,12 @@ async def get_marine_weather(
                     }
                 }
             else:
+                logger.error("Weather API error response: %s", response.text[:500] if response.text else "No response body")
                 return {
                     "success": False,
                     "error": f"Weather API returned status {response.status_code}",
-                    "location": location
+                    "location": location,
+                    "details": response.text[:200] if response.text else None
                 }
 
     except Exception as e:
